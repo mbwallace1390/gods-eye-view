@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createServer } from 'node:http';
 import { Readable } from 'node:stream';
 import {
   mkdtempSync,
@@ -20,6 +21,10 @@ import { openAiRealtimeProxy } from 'gods-eye-view/server/providers/openai';
 import { keySetupEndpoint } from 'gods-eye-view/server/standalone/key-setup';
 import { realtimeInstructions } from '../../server/providers/openai/instructions.js';
 import { GEV_REALTIME_TOOLS } from '../../server/providers/openai/tools.js';
+import { createDebugLogHandler } from '../../server/providers/openai/debug-log.js';
+import { attachVoiceResult } from '../voice/speech.js';
+import { sanitizeDebugValue } from '../voice/realtimeDiagnostics.js';
+import { standaloneVoiceTools } from '../../server/standalone/voiceTools.js';
 
 function install(plugin, preview = false) {
   const routes = new Map();
@@ -194,6 +199,64 @@ test('Realtime handler preserves tools and default instructions, isolates suppli
   assert.equal(sent[0].session.instructions, sent[2].session.instructions);
 });
 
+test('caption transcription is on by default, reported to the client meter, and can be turned off', async (t) => {
+  env(t, 'OPENAI_API_KEY', 'fixture-upstream-secret');
+  env(t, 'GEV_RATELIMIT_OPENAI_PER_MIN', undefined);
+  const sent = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    sent.push(JSON.parse(options.body));
+    return Response.json({ value: 'fixture-ephemeral' });
+  });
+  for (const [setting, expected] of [
+    [undefined, 'gpt-4o-mini-transcribe'],
+    ['off', 'off'],
+  ]) {
+    env(t, 'OPENAI_REALTIME_TRANSCRIBE_MODEL', setting);
+    const response = await request(
+      install(openAiRealtimeProxy()).get('/api/realtime/token'),
+    );
+    assert.equal(response.headers['x-gev-voice-transcribe-model'], expected);
+    assert.equal(
+      sent.at(-1).session.audio.input.transcription?.model ?? 'off',
+      expected,
+    );
+  }
+});
+
+test('Realtime sessions carry supplied tools, and the standalone voice adds the catalog queries', async (t) => {
+  env(t, 'OPENAI_API_KEY', 'fixture-upstream-secret');
+  env(t, 'GEV_RATELIMIT_OPENAI_PER_MIN', undefined);
+  const sent = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    sent.push(JSON.parse(options.body));
+    return Response.json({ value: 'fixture-ephemeral' });
+  });
+  const tools = standaloneVoiceTools();
+  const response = await request(
+    install(openAiRealtimeProxy({ realtime: { tools } })).get(
+      '/api/realtime/token',
+    ),
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(sent.at(-1).session.tools, tools);
+  const names = tools.map((tool) => tool.name);
+  assert.equal(new Set(names).size, names.length);
+  assert.deepEqual(
+    tools.slice(0, GEV_REALTIME_TOOLS.length),
+    GEV_REALTIME_TOOLS,
+  );
+  assert.ok(names.includes('get_weather'));
+  assert.ok(names.includes('military_awareness'));
+  assert.ok(!names.includes('show_in_gods_eye_view'));
+  assert.ok(!names.includes('aircraft_in_area'));
+  assert.ok(!names.includes('get_weather_map'));
+  // The action of the same name answers satellite passes.
+  assert.equal(
+    tools.findLast((tool) => tool.name === 'next_satellite_pass'),
+    GEV_REALTIME_TOOLS.find((tool) => tool.name === 'next_satellite_pass'),
+  );
+});
+
 test('debug logging resolves each supplied application directory independently', async (t) => {
   const first = root(t),
     second = root(t);
@@ -279,7 +342,460 @@ test('Realtime service configuration selects compatible endpoint/model without f
     url: '/?tier=arbitrary-model&model=other',
   });
   assert.equal(response.status, 200);
+  assert.deepEqual(response.json(), { value: 'short-lived-fixture' });
   assert.equal(response.headers['x-gev-voice-model'], 'configured-model');
   assert.equal(response.headers['cache-control'], 'no-store');
   assert.doesNotMatch(response.body, /server-fixture|voice\.example/);
+});
+
+test('OpenAI routes answer generically when the upstream or the request fails', async (t) => {
+  env(t, 'OPENAI_API_KEY', 'fixture-upstream-secret');
+  env(t, 'GEV_RATELIMIT_OPENAI_PER_MIN', undefined);
+  const leak =
+    'fixture-upstream-secret req_fixture_1234 org-fixture quota exhausted';
+
+  // `data.error.message` is OpenAI's own wording — request ids, organization
+  // hints, quota phrasing — and was relayed verbatim whenever upstream was not ok.
+  t.mock.method(globalThis, 'fetch', async () =>
+    Response.json({ error: { message: leak } }, { status: 429 }),
+  );
+  const summary = await request(
+    install(openAiRealtimeProxy()).get('/api/openai/hud-summary'),
+    { method: 'POST', body: JSON.stringify({ context: {} }) },
+  );
+  assert.equal(summary.json().error, 'OpenAI HUD summary request failed');
+  assert.equal(summary.body.includes('req_fixture_1234'), false);
+  assert.equal(summary.body.includes('fixture-upstream-secret'), false);
+
+  // An HTTP error from the client-secret endpoint carries the same upstream
+  // detail, while a successful response must still pass the ephemeral secret.
+  t.mock.restoreAll();
+  t.mock.method(globalThis, 'fetch', async () =>
+    Response.json({ error: { message: leak } }, { status: 429 }),
+  );
+  const rejectedToken = await request(
+    install(openAiRealtimeProxy()).get('/api/realtime/token'),
+  );
+  assert.equal(rejectedToken.status, 429);
+  assert.equal(
+    rejectedToken.headers['content-type'],
+    'application/json; charset=utf-8',
+  );
+  assert.deepEqual(rejectedToken.json(), {
+    error: 'Failed to create Realtime token',
+  });
+  assert.equal(rejectedToken.body.includes('req_fixture_1234'), false);
+  assert.equal(rejectedToken.body.includes('fixture-upstream-secret'), false);
+
+  // A network fault surfaced a resolver message naming the upstream host.
+  t.mock.restoreAll();
+  t.mock.method(globalThis, 'fetch', async () => {
+    throw Error(`getaddrinfo ENOTFOUND api.openai.com ${leak}`);
+  });
+  const token = await request(
+    install(openAiRealtimeProxy()).get('/api/realtime/token'),
+  );
+  assert.equal(token.status, 502);
+  assert.deepEqual(token.json(), { error: 'Failed to create Realtime token' });
+  assert.equal(token.body.includes('api.openai.com'), false);
+  assert.equal(token.body.includes('fixture-upstream-secret'), false);
+});
+
+test('the debug-log sink omits what people said and tool arguments unless content logging is enabled', async (t) => {
+  const nestObject = (value, levels) => {
+    let nested = value;
+    for (let index = 0; index < levels; index += 1) nested = { nested };
+    return nested;
+  };
+  const nestArray = (value, levels) => {
+    let nested = value;
+    for (let index = 0; index < levels; index += 1) nested = [nested];
+    return nested;
+  };
+  const records = [
+    {
+      timestamp: '2026-10-05T00:00:00.000Z',
+      sessionId: 'gev-session-1',
+      event: 'tool.call',
+      status: 'active',
+      payload: {
+        name: 'analyst_query',
+        callId: 'call-1',
+        arguments: { location: '12 Elm Street', note: 'meet Alice there' },
+      },
+    },
+    {
+      timestamp: '2026-10-05T00:00:01.000Z',
+      sessionId: 'gev-session-1',
+      event: 'server.event',
+      status: 'active',
+      payload: {
+        type: 'response.function_call_arguments.done',
+        eventId: 'event-1',
+        responseId: 'response-1',
+        payload: {
+          type: 'response.function_call_arguments.done',
+          event_id: 'event-1',
+          response_id: 'response-1',
+          item_id: 'item-1',
+          output_index: 0,
+          call_id: 'call-1',
+          name: 'analyst_query',
+          arguments: '{"query":"Tokyo Station"}',
+        },
+      },
+    },
+    {
+      event: 'server.event',
+      status: 'active',
+      payload: {
+        type: 'response.audio_transcript.done',
+        transcript: 'my home address is 12 Elm Street',
+        text: 'call my sister',
+        delta: 'Flying to Tokyo.',
+        usage: { input_tokens: 40 },
+      },
+    },
+    {
+      event: 'voice.cost',
+      status: 'active',
+      payload: { delta: 17, total: 41 },
+    },
+    {
+      event: 'tool.call',
+      status: 'active',
+      payload: { name: 'adjust_camera_zoom', callId: 'call-2', arguments: 2 },
+    },
+    {
+      event: 'deep.object',
+      status: 'active',
+      payload: nestObject(
+        {
+          transcript: 'deep-object-transcript-secret',
+          arguments: { query: 'deep-object-argument-secret' },
+        },
+        14,
+      ),
+    },
+    {
+      event: 'deep.array',
+      status: 'active',
+      payload: nestArray(
+        {
+          transcript: 'deep-array-transcript-secret',
+          arguments: { query: 'deep-array-argument-secret' },
+        },
+        14,
+      ),
+    },
+  ];
+  for (const includeContent of [false, true]) {
+    const sourceRoot = root(t);
+    const handler = createDebugLogHandler({ sourceRoot, includeContent });
+    for (const record of records) {
+      const response = await request(handler, {
+        method: 'POST',
+        body: JSON.stringify(record),
+      });
+      assert.equal(response.status, 204);
+    }
+    const logged = readFileSync(
+      path.join(sourceRoot, '.gev-logs/realtime-conversations.jsonl'),
+      'utf8',
+    );
+    assert.equal(logged.includes('Elm Street'), includeContent);
+    assert.equal(logged.includes('call my sister'), includeContent);
+    assert.equal(logged.includes('meet Alice there'), includeContent);
+    assert.equal(logged.includes('Tokyo Station'), includeContent);
+    assert.equal(logged.includes('Flying to Tokyo'), includeContent);
+    assert.equal(
+      logged.includes('deep-object-transcript-secret'),
+      includeContent,
+    );
+    assert.equal(
+      logged.includes('deep-object-argument-secret'),
+      includeContent,
+    );
+    assert.equal(
+      logged.includes('deep-array-transcript-secret'),
+      includeContent,
+    );
+    assert.equal(logged.includes('deep-array-argument-secret'), includeContent);
+    const [
+      toolCall,
+      serverEvent,
+      transcriptEvent,
+      numericDelta,
+      numericArguments,
+      deepObject,
+      deepArray,
+    ] = logged
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.equal(toolCall.timestamp, records[0].timestamp);
+    assert.equal(toolCall.sessionId, 'gev-session-1');
+    assert.equal(toolCall.event, 'tool.call');
+    assert.equal(toolCall.status, 'active');
+    assert.equal(toolCall.payload.name, 'analyst_query');
+    assert.equal(toolCall.payload.callId, 'call-1');
+    assert.equal(serverEvent.payload.eventId, 'event-1');
+    assert.equal(serverEvent.payload.responseId, 'response-1');
+    assert.equal(serverEvent.payload.payload.event_id, 'event-1');
+    assert.equal(serverEvent.payload.payload.response_id, 'response-1');
+    assert.equal(serverEvent.payload.payload.item_id, 'item-1');
+    assert.equal(serverEvent.payload.payload.output_index, 0);
+    assert.equal(serverEvent.payload.payload.call_id, 'call-1');
+    assert.equal(serverEvent.payload.payload.name, 'analyst_query');
+    assert.equal(transcriptEvent.payload.usage.input_tokens, 40);
+    assert.equal(numericDelta.payload.delta, 17);
+    assert.equal(numericDelta.payload.total, 41);
+    if (!includeContent) {
+      assert.equal(toolCall.payload.arguments, '[omitted]');
+      assert.match(
+        serverEvent.payload.payload.arguments,
+        /^\[omitted \d+ chars\]$/,
+      );
+      assert.equal(transcriptEvent.payload.transcript, '[omitted 32 chars]');
+      assert.equal(transcriptEvent.payload.text, '[omitted 14 chars]');
+      assert.equal(transcriptEvent.payload.delta, '[omitted 16 chars]');
+      assert.equal(numericArguments.payload.arguments, '[omitted]');
+      assert.equal(
+        JSON.stringify(deepObject.payload).includes('[omitted: max depth]'),
+        true,
+      );
+      assert.equal(
+        JSON.stringify(deepArray.payload).includes('[omitted: max depth]'),
+        true,
+      );
+    } else {
+      assert.deepEqual(
+        toolCall.payload.arguments,
+        records[0].payload.arguments,
+      );
+      assert.equal(
+        serverEvent.payload.payload.arguments,
+        records[1].payload.payload.arguments,
+      );
+      assert.equal(numericArguments.payload.arguments, 2);
+    }
+  }
+});
+
+test('debug logs omit structured and serialized tool results unless content logging is enabled', async (t) => {
+  const secret = 'private-address-fixture';
+  const result = attachVoiceResult('fly_to_location', {
+    ok: true,
+    query: secret,
+    label: secret,
+    arrived: true,
+    // New tool-specific fields must not need their own redaction rule.
+    futureField: { nested: [secret] },
+  });
+  const records = [
+    {
+      event: 'tool.result',
+      payload: { name: 'fly_to_location', callId: 'call-1', result },
+    },
+    {
+      event: 'client.function_call_output',
+      payload: {
+        message: {
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: 'call-1',
+            output: JSON.stringify(result),
+          },
+        },
+      },
+    },
+    {
+      event: 'server.event',
+      payload: {
+        response: {
+          id: 'response-1',
+          output: [
+            {
+              type: 'message',
+              content: [{ type: 'output_text', text: secret }],
+            },
+          ],
+          usage: { input_tokens: 40, output_tokens: 10 },
+        },
+      },
+    },
+  ].map((record) => sanitizeDebugValue(record));
+  for (const includeContent of [false, true]) {
+    const sourceRoot = root(t);
+    const handler = createDebugLogHandler({ sourceRoot, includeContent });
+    for (const record of records) {
+      const response = await request(handler, {
+        method: 'POST',
+        body: JSON.stringify(record),
+      });
+      assert.equal(response.status, 204);
+    }
+    const logged = readFileSync(
+      path.join(sourceRoot, '.gev-logs/realtime-conversations.jsonl'),
+      'utf8',
+    );
+    assert.equal(logged.includes(secret), includeContent);
+    const [tool, client, server] = logged.trim().split('\n').map(JSON.parse);
+    assert.equal(tool.payload.name, 'fly_to_location');
+    assert.equal(tool.payload.callId, 'call-1');
+    assert.equal(client.payload.message.item.call_id, 'call-1');
+    assert.equal(server.payload.response.id, 'response-1');
+    assert.equal(server.payload.response.output[0].type, 'message');
+    assert.deepEqual(
+      server.payload.response.usage,
+      records[2].payload.response.usage,
+    );
+    if (includeContent) {
+      assert.deepEqual(tool.payload.result, result);
+      assert.equal(client.payload.message.item.output, JSON.stringify(result));
+    } else {
+      assert.equal(tool.payload.result, '[omitted]');
+      assert.match(
+        client.payload.message.item.output,
+        /^\[omitted \d+ chars\]$/,
+      );
+    }
+  }
+});
+
+test('the debug-log sink stays bounded, rate limited, and quiet about failures', async (t) => {
+  const sourceRoot = root(t);
+  const handler = install(openAiRealtimeProxy({ sourceRoot })).get(
+    '/api/realtime/debug-log',
+  );
+  const file = path.join(sourceRoot, '.gev-logs/realtime-conversations.jsonl');
+  const write = (record) =>
+    request(handler, { method: 'POST', body: JSON.stringify(record) });
+
+  // A malformed record is the caller's fault and a 400; neither answer carries
+  // the error text, which for a write failure is an errno and an absolute path.
+  const malformed = await request(handler, { method: 'POST', body: '{nope' });
+  assert.equal(malformed.status, 400);
+  assert.deepEqual(malformed.json(), {
+    error: 'Failed to write Realtime debug log',
+  });
+
+  // This limiter has no opt-out, unlike the one the cost-bearing routes share:
+  // 120/min per IP, far above what a voice session writes.
+  let limited = null;
+  let accepted = 0;
+  for (let n = 0; n < 130 && !limited; n += 1) {
+    const response = await write({ n });
+    if (response.status === 429) limited = response;
+    else if (response.status === 204) accepted += 1;
+  }
+  assert.ok(limited, 'the sink refuses a caller past its per-minute ceiling');
+  assert.equal(limited.headers['retry-after'], '60');
+  assert.deepEqual(limited.json(), { error: 'Rate limit exceeded' });
+  // The limiter counts requests rather than successful writes, so the malformed
+  // record above already spent one of the 120 slots.
+  assert.equal(accepted, 119);
+
+  // Every accepted record is on disk and parses: the queue serializes appends,
+  // so none was lost or truncated by the ones beside it.
+  const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  assert.equal(lines.length, accepted);
+  for (const line of lines) assert.doesNotThrow(() => JSON.parse(line));
+  assert.ok(lines.every((line) => JSON.parse(line).loggedAt));
+});
+
+test('a debug-log record cannot supply its own timestamp', async (t) => {
+  const sourceRoot = root(t);
+  const handler = install(openAiRealtimeProxy({ sourceRoot })).get(
+    '/api/realtime/debug-log',
+  );
+  const before = Date.now();
+  const response = await request(handler, {
+    method: 'POST',
+    body: JSON.stringify({ loggedAt: '1999-01-01T00:00:00.000Z', note: 'x' }),
+  });
+  assert.equal(response.status, 204);
+  const file = path.join(sourceRoot, '.gev-logs/realtime-conversations.jsonl');
+  const [line] = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  const record = JSON.parse(line);
+  assert.equal(record.note, 'x');
+  assert.ok(Date.parse(record.loggedAt) >= before - 1000);
+});
+
+test('an oversized debug-log request receives the fixed error response', async (t) => {
+  const handler = install(openAiRealtimeProxy({ sourceRoot: root(t) })).get(
+    '/api/realtime/debug-log',
+  );
+  const server = createServer(handler);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const response = await fetch(
+    `http://127.0.0.1:${server.address().port}/api/realtime/debug-log`,
+    { method: 'POST', body: 'x'.repeat(8 * 1024 * 1024 + 1) },
+  );
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    error: 'Failed to write Realtime debug log',
+  });
+});
+
+test('the debug log rotates instead of growing without bound', async (t) => {
+  const sourceRoot = root(t);
+  const handler = install(openAiRealtimeProxy({ sourceRoot })).get(
+    '/api/realtime/debug-log',
+  );
+  const file = path.join(sourceRoot, '.gev-logs/realtime-conversations.jsonl');
+
+  // 8 MB bounds one request body; nothing bounded the file until now, so a
+  // single page could grow it for as long as the dev server ran. Each record
+  // here is ~1 MB, well inside the body cap.
+  const pad = 'x'.repeat(1024 * 1024);
+  // Seventy-two records force two rotations. The second one replaces an
+  // existing `.1`, which requires an explicit removal on Windows.
+  for (let n = 0; n < 72; n += 1) {
+    assert.equal(
+      (
+        await request(handler, {
+          method: 'POST',
+          body: JSON.stringify({ n, pad }),
+        })
+      ).status,
+      204,
+    );
+  }
+
+  const live = statSync(file).size;
+  const previous = statSync(`${file}.1`).size;
+  assert.ok(live <= 32 * 1024 * 1024, `live log under the ceiling (${live})`);
+  assert.ok(
+    live + previous <= 64 * 1024 * 1024,
+    'both generations together stay within twice the ceiling',
+  );
+  // Unrotated, these records would be ~75 MB in one file.
+  assert.ok(live + previous < 64 * 1024 * 1024);
+  assert.ok(!existsSync(`${file}.2`), 'exactly one generation is retained');
+});
+
+test('the voice instructions name only tools the voice session offers', async () => {
+  const { coreTools } = await import('../tools/index.js');
+  const tools = new Set(standaloneVoiceTools().map((tool) => tool.name));
+  const known = new Set([
+    ...coreTools.map((tool) => tool.name),
+    ...GEV_REALTIME_TOOLS.map((tool) => tool.name),
+  ]);
+  const named = new Set(
+    realtimeInstructions().match(/\b[a-z]+(?:_[a-z]+)+\b/g),
+  );
+  const missing = [...named].filter(
+    (name) => known.has(name) && !tools.has(name),
+  );
+  assert.deepEqual(missing, []);
+});
+
+test('the voice instructions send vessels, however heard, to the ships layer', () => {
+  const text = realtimeInstructions();
+  assert.match(text, /"vessels" is easily heard as "visuals"/);
+  assert.match(text, /set_layer_visibility\{layerId:"ais-live-vessels"\}/);
 });
